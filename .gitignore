@@ -3,3 +3,4 @@ data/bot.db*
 data/memory/*.md
 data/impressions/*.md
 .env
+data/persona.md
