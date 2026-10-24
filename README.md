@@ -42,6 +42,8 @@ NapCat 侧需要：
 2. 开启正向 WebSocket 服务，例如监听 `127.0.0.1:3001`
 3. 确认 bot 与 NapCat 在同一台机器或网络可达
 
+> NapCat 监听 `0.0.0.0` 时通常强制要求设置 token。此时在 WebUI 里设置 token，并把同一个值填到 `.env` 的 `WS_TOKEN`；如果 NapCat 和 Tamaki 在同一台机器，也可以继续监听 `127.0.0.1` 且不设 token。
+
 可选：把人设写到 `data/persona.md`，不存在时使用内置默认人设。
 
 ## 配置
@@ -51,6 +53,7 @@ NapCat 侧需要：
 | 变量 | 必填 | 默认值 | 说明 |
 |---|---|---|---|
 | `WS_URL` | 否 | `ws://127.0.0.1:3001` | NapCat 正向 WS 地址 |
+| `WS_TOKEN` | 否 | 空 | NapCat 配置的 access token，以 `Authorization: Bearer` 发送 |
 | `BOT_QQ` | 是 | — | 机器人 QQ，需与 NapCat 登录号一致 |
 | `ADMIN_QQ` | 是 | — | 管理员 QQ，唯一允许私聊的人 |
 | `ALLOWED_GROUPS` | 是 | — | 允许的群号，逗号分隔 |
@@ -155,7 +158,7 @@ pnpm e2e         # mock NapCat + stub LLM，端到端 22 项断言
 pnpm mock        # 单独启动 mock NapCat（默认 3099）
 ```
 
-`scripts/mock-napcat.ts` 模拟了 OneBot v11 的 action 响应、心跳、事件注入和断线；`scripts/e2e.ts` 覆盖白名单、自消息、去重、限流、串行发送、引用触发、私聊权限、上下文窗口、总结与 cursor、工具权限、重连和心跳超时。
+`scripts/mock-napcat.ts` 模拟了 OneBot v11 的 action 响应、心跳、事件注入和断线；`scripts/e2e.ts` 覆盖白名单、自消息、去重、限流、串行发送、引用触发、私聊权限、上下文窗口、总结与 cursor、工具权限、token 请求头、重连和心跳超时。
 
 ## 已知边界
 

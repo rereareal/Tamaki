@@ -18,6 +18,7 @@ const dataDir = resolve(process.env.DATA_DIR ?? 'data');
 
 export const config = {
   wsUrl: process.env.WS_URL ?? 'ws://127.0.0.1:3001',
+  wsToken: process.env.WS_TOKEN?.trim() ?? '',
   botQQ: Number(required('BOT_QQ')),
   adminQQ: Number(required('ADMIN_QQ')),
   allowedGroups: required('ALLOWED_GROUPS')

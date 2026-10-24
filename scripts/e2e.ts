@@ -56,6 +56,7 @@ const { buildContextMessages } = await import('../src/context/builder');
 const { runWithTools } = await import('../src/tools/runner');
 const { registerTool, listToolSchemas } = await import('../src/tools/registry');
 const { scopeOf, startOfLogicalDay } = await import('../src/store/messages');
+const { NapCatClient } = await import('../src/ws');
 const { openDb } = await import('../src/store/db');
 const { MessageStore } = await import('../src/store/messages');
 
@@ -63,6 +64,18 @@ const app = start({ callLLM });
 
 try {
   await waitFor('ws connected', () => app.client.isOpen);
+  await sleep(100);
+
+  // 0. WS_TOKEN 通过 Authorization 头发送
+  const tokenClient = new NapCatClient(`ws://127.0.0.1:${PORT}`, {
+    token: 'secret-token',
+    reconnectDelayMs: 60_000,
+    heartbeatTimeoutMs: 60_000,
+  });
+  tokenClient.connect();
+  await waitFor('token header', () => mock.lastAuthHeader === 'Bearer secret-token');
+  check('WS_TOKEN 以 Authorization: Bearer 发送', mock.lastAuthHeader === 'Bearer secret-token');
+  tokenClient.close();
   await sleep(100);
 
   const rows = () => app.store.getMessagesBetween(`group:${GROUP}`, 0, Date.now() + 1000);

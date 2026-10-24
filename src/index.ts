@@ -61,6 +61,7 @@ export function start(opts: StartOptions = {}): Tamaki {
   const client = new NapCatClient(config.wsUrl, {
     reconnectDelayMs: config.reconnectDelayMs,
     heartbeatTimeoutMs: config.heartbeatTimeoutMs,
+    token: config.wsToken,
   });
   const callLLM = opts.callLLM ?? createLLMFromConfig(config.llm);
   const summarizer = new Summarizer(store, memory, callLLM, {

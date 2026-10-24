@@ -21,6 +21,7 @@ export class MockNapCat {
   actions: RecordedAction[] = [];
   connectionCount = 0;
   lastSentMessageId = 0;
+  lastAuthHeader = '';
 
   constructor(
     readonly port: number,
@@ -38,7 +39,8 @@ export class MockNapCat {
         resolve();
       });
 
-      wss.on('connection', (ws) => {
+      wss.on('connection', (ws, req) => {
+        this.lastAuthHeader = String(req.headers.authorization ?? '');
         this.clients.add(ws);
         this.connectionCount++;
         ws.on('close', () => this.clients.delete(ws));

@@ -10,6 +10,8 @@ interface Pending {
 export interface NapCatClientOptions {
   reconnectDelayMs?: number;
   heartbeatTimeoutMs?: number;
+  /** NapCat 配置的 access token，以 Authorization: Bearer 发送。 */
+  token?: string;
 }
 
 /**
@@ -42,7 +44,8 @@ export class NapCatClient {
 
   connect(): void {
     this.closedByUser = false;
-    const ws = new WebSocket(this.url);
+    const wsOptions = this.opts.token ? { headers: { Authorization: `Bearer ${this.opts.token}` } } : undefined;
+    const ws = new WebSocket(this.url, wsOptions);
     this.ws = ws;
 
     ws.on('open', () => {
