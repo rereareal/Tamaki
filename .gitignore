@@ -1,0 +1,5 @@
+node_modules/
+data/bot.db*
+data/memory/*.md
+data/impressions/*.md
+.env
