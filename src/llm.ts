@@ -1,5 +1,8 @@
 import type { ChatMessage, LLMCall, ToolSchema } from './tools/runner';
 import type { AppConfig } from './config';
+import { logger } from './log';
+
+const log = logger.child('llm');
 
 export type { ChatMessage, LLMCall, ToolSchema };
 
@@ -44,12 +47,20 @@ export function createLLM(opts: LLMOptions): LLMCall {
 
   return async (messages: ChatMessage[], tools?: ToolSchema[]) => {
     const client = await getClient();
-    const res = await client.chat.completions.create({
-      model: opts.model,
-      messages: messages as any,
-      ...(tools && tools.length > 0 ? { tools: tools as any } : {}),
-      temperature: 0.8,
-    });
+    const started = Date.now();
+    let res: any;
+    try {
+      res = await client.chat.completions.create({
+        model: opts.model,
+        messages: messages as any,
+        ...(tools && tools.length > 0 ? { tools: tools as any } : {}),
+        temperature: 0.8,
+      });
+    } catch (err) {
+      log.error('completion failed', err, { model: opts.model, ms: Date.now() - started });
+      throw err;
+    }
+    log.debug('completion', { model: opts.model, ms: Date.now() - started, tools: tools?.length ?? 0 });
     const msg = res.choices[0]?.message;
     return {
       role: 'assistant',

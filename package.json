@@ -7,7 +7,9 @@
     "start": "node --env-file-if-exists=.env --import tsx src/index.ts",
     "mock": "tsx scripts/mock-napcat.ts",
     "e2e": "tsx scripts/e2e.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "import:corpus": "tsx scripts/import-corpus.ts",
+    "translate": "node --env-file-if-exists=.env --import tsx scripts/translate-corpus.ts"
   },
   "dependencies": {
     "openai": "^4.104.0",

@@ -15,6 +15,7 @@ function int(name: string, fallback: number): number {
 }
 
 const dataDir = resolve(process.env.DATA_DIR ?? 'data');
+const runtimeDir = resolve(dataDir, 'runtime');
 
 export const config = {
   wsUrl: process.env.WS_URL ?? 'ws://127.0.0.1:3001',
@@ -29,10 +30,17 @@ export const config = {
   botName: process.env.BOT_NAME?.trim() ?? '',
 
   dataDir,
-  dbPath: resolve(dataDir, 'bot.db'),
-  memoryDir: resolve(dataDir, 'memory'),
-  impressionsDir: resolve(dataDir, 'impressions'),
-  personaPath: resolve(dataDir, 'persona.md'),
+  runtimeDir,
+  dbPath: resolve(runtimeDir, 'bot.db'),
+  logDir: resolve(process.env.LOG_DIR ?? resolve(runtimeDir, 'logs')),
+  logLevel: process.env.LOG_LEVEL ?? 'info',
+  logToFile: process.env.LOG_TO_FILE !== '0',
+  logRetentionDays: int('LOG_RETENTION_DAYS', 7),
+  corporaDir: resolve(process.env.CORPORA_DIR ?? resolve(dataDir, 'corpora')),
+  activeCharacterFile: resolve(process.env.ACTIVE_CHARACTER_FILE ?? resolve(runtimeDir, 'active-character.txt')),
+
+  /** 本地角色定义目录；默认与 corpora 同级。 */
+  charactersDir: resolve(process.env.CHARACTERS_DIR ?? resolve(dataDir, 'characters')),
 
   timeZone: process.env.TZ_NAME ?? 'Asia/Shanghai',
   summaryHour: int('SUMMARY_HOUR', 3),

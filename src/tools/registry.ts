@@ -1,6 +1,8 @@
 import type { MessageEvent, MessageSegment } from '../types';
 import type { MemoryStore } from '../store/memory';
 import type { MessageStore, Scope } from '../store/messages';
+import type { CharacterRuntime } from '../character/loader';
+import type { ImpressionStore } from '../store/impressions';
 import type { ToolSchema } from './runner';
 
 export interface ToolContext {
@@ -9,8 +11,11 @@ export interface ToolContext {
   scope: Scope;
   store: MessageStore;
   memory: MemoryStore;
+  impressions: ImpressionStore;
   botQQ: number;
   botName: string;
+  /** 当前激活角色；语料、侧写、session 都在这里。 */
+  character: CharacterRuntime;
   /** 需要主动发消息时用（当前内置 tool 未使用）。 */
   reply?: (segments: MessageSegment[]) => Promise<void>;
 }

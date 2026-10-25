@@ -20,6 +20,9 @@ export interface ToolSchema {
 export type LLMCall = (messages: ChatMessage[], tools?: ToolSchema[]) => Promise<ChatMessage>;
 
 import type { ToolContext } from './registry';
+import { logger } from '../log';
+
+const log = logger.child('tools');
 import { getTool, listToolSchemas } from './registry';
 
 const DEFAULT_TOOL_TIMEOUT = 10_000;
@@ -63,6 +66,7 @@ export async function runWithTools(
     for (const call of calls) {
       const name = call.function?.name ?? '';
       const tool = getTool(name);
+      log.debug('tool call', { name, round: round + 1 });
       let payload: string;
 
       try {
@@ -83,7 +87,9 @@ export async function runWithTools(
         );
         payload = JSON.stringify({ ok: true, result: result ?? null });
       } catch (err) {
-        payload = JSON.stringify({ ok: false, error: (err as Error).message });
+        const message = (err as Error).message;
+        log.warn('tool failed', { name, error: message });
+        payload = JSON.stringify({ ok: false, error: message });
       }
 
       convo.push({
@@ -95,5 +101,6 @@ export async function runWithTools(
     }
   }
 
+  log.warn('max tool rounds reached', { maxRounds });
   return '';
 }

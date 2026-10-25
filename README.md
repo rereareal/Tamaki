@@ -1,172 +1,368 @@
 # Tamaki
 
-一个轻量的 QQ 群机器人框架：通过正向 WebSocket 直接对接 [NapCat](https://github.com/NapNeko/NapCatQQ)（OneBot v11），只服务一个或少数几个群，不引入 AstrBot 等重型框架。
+一个轻量的 QQ 群机器人框架：通过正向 WebSocket 对接 [NapCat](https://github.com/NapNeko/NapCatQQ)（OneBot v11），只服务少数群聊。
 
-- 15 个 TypeScript 文件，运行时依赖只有 `ws` 和 `openai`
-- SQLite 用 Node 内置 `node:sqlite`，配置用 Node 内置 `--env-file-if-exists`，无需 dotenv
-- 消息实时入库；定时/按阈值把对话压缩进 Markdown 记忆，已总结内容不重放
-- 内置廉价风控、串行出站队列和 OpenAI function calling
+> 仓库只包含框架、脚本和文档示例。具体角色的 persona、台词、记忆、印象、译文都保存在本地 `data/`，不会上传到 git。
 
-## 功能
+当前架构的重点：
 
-- **连接**：正向 WS、`echo` 配对、断线 3s 重连、90s 无心跳强制重连
-- **风控**：群白名单 → 忽略自己 → 5s 去重 → 每用户 10s 最多 5 条
-- **出站**：所有消息走同一条串行队列，间隔 = 300–800ms 随机 + 消息类型固定延迟（text 200 / image 800 / record 1500 / face 100）
-- **持久化**：SQLite WAL，入站消息和 bot 回复都实时写入
-- **上下文**：系统提示（人设 + 长期记忆 + 群友印象）+ 上次总结后的对话 + 当前新消息
-- **记忆**：每天 `SUMMARY_HOUR` 定时总结 + 每会话累计 `SUMMARY_THRESHOLD` 条即时总结；写 MD、写 `memories` 版本、推进 cursor
-- **工具**：OpenAI function calling 格式，最多 5 轮，单工具 10s 超时，`adminOnly` 双重校验
-- **触发**：群里被 @、引用 bot 的消息、文本包含 bot 昵称；管理员私聊总是回复
+- **消息只存一份**：群消息统一进 `messages`，用 `sessions` 记录“角色在线时间”，查询时 JOIN 过滤。没有每个角色一份消息。
+- **语料库可多个，角色可绑定多个**：`data/corpora/<id>/corpus.db` 一个语料库一个 DB；角色 `meta.json` 的 `corpora` 列出绑定关系，检索时跨库合并。
+- **角色卡与语料库同级**：都在 `data/` 下，定义与运行时数据分开。
+- **角色靠目录扫描**：`src/character/loader.ts` 扫描指定文件夹，代码里不出现任何具体角色。
+- **全局协议在代码里**：`src/context/builder.ts` 的 `PROTOCOL` 常量直接作为系统提示词第一段，不再读外部 md。
+- **记忆按角色隔离**：`memories` / `summary_cursor` 带 `character_id`，每个角色只看到自己在线期间的群聊。
 
 ## 环境要求
 
-- Node.js 24+（需要 `node:sqlite` 和 `--env-file-if-exists`）
+- Node.js 24+
 - pnpm（或 npm / yarn）
-- 已登录 QQ 的 NapCat，开启正向 WebSocket，端口与 `WS_URL` 一致
-- 一个 OpenAI 兼容的 Chat Completions 接口（默认按 `deepseek-flash` 配置）
+- 已登录 QQ 的 NapCat，开启正向 WebSocket
+- 一个 OpenAI 兼容的 Chat Completions 接口
 
 ## 快速开始
 
 ```bash
 pnpm install
-
 cp .env.example .env
-# 编辑 .env，至少填 BOT_QQ / ADMIN_QQ / ALLOWED_GROUPS / LLM_API_KEY
+# 编辑 .env：BOT_QQ / ADMIN_QQ / ALLOWED_GROUPS / LLM_API_KEY
 
+# 1. 本地角色：按下方「角色卡」示例创建
+mkdir -p data/characters/example
+# data/characters/example/meta.json
+# data/characters/example/persona.md
+
+# 2. 本地语料库：按下方「语料库」示例创建
+mkdir -p data/corpora/example-corpus/raw
+# data/corpora/example-corpus/meta.json
+# 把日文 CSV 放到 data/corpora/example-corpus/raw/adv/...
+
+# 3. 导入日文剧情
+pnpm import:corpus -- --corpus example-corpus
+
+# 4. 选择角色
+mkdir -p data/runtime
+echo example > data/runtime/active-character.txt
+
+# 5. 启动
 pnpm start
 ```
 
 NapCat 侧需要：
 
 1. 用与 `BOT_QQ` 相同的 QQ 登录
-2. 开启正向 WebSocket 服务，例如监听 `127.0.0.1:3001`
-3. 确认 bot 与 NapCat 在同一台机器或网络可达
+2. 开启正向 WebSocket，端口与 `WS_URL` 一致
+3. 监听 `0.0.0.0` 时通常要配 token，把同一个值填到 `.env` 的 `WS_TOKEN`
 
-> NapCat 监听 `0.0.0.0` 时通常强制要求设置 token。此时在 WebUI 里设置 token，并把同一个值填到 `.env` 的 `WS_TOKEN`；如果 NapCat 和 Tamaki 在同一台机器，也可以继续监听 `127.0.0.1` 且不设 token。
-
-可选：把人设写到 `data/persona.md`，不存在时使用内置默认人设。
-
-## 配置
-
-所有配置来自环境变量，启动时由 `src/config.ts` 校验。
-
-| 变量 | 必填 | 默认值 | 说明 |
-|---|---|---|---|
-| `WS_URL` | 否 | `ws://127.0.0.1:3001` | NapCat 正向 WS 地址 |
-| `WS_TOKEN` | 否 | 空 | NapCat 配置的 access token，以 `Authorization: Bearer` 发送 |
-| `BOT_QQ` | 是 | — | 机器人 QQ，需与 NapCat 登录号一致 |
-| `ADMIN_QQ` | 是 | — | 管理员 QQ，唯一允许私聊的人 |
-| `ALLOWED_GROUPS` | 是 | — | 允许的群号，逗号分隔 |
-| `BOT_NAME` | 否 | 空 | 机器人昵称；留空则启动后从 `get_login_info` 获取 |
-| `LLM_API_KEY` | 是* | — | *`LLM_STUB=1` 时可不填 |
-| `LLM_BASE_URL` | 否 | `https://api.deepseek.com/v1` | OpenAI 兼容端点 |
-| `LLM_MODEL` | 否 | `deepseek-flash` | 模型名 |
-| `LLM_STUB` | 否 | `0` | 设为 `1` 时不发网络请求，返回可预测文本，便于自测 |
-| `DATA_DIR` | 否 | `./data` | 数据目录 |
-| `TZ_NAME` | 否 | `Asia/Shanghai` | 时区 |
-| `SUMMARY_HOUR` | 否 | `3` | 定时总结小时，同时是上下文“逻辑日界” |
-| `SUMMARY_THRESHOLD` | 否 | `200` | 单会话累计多少条触发即时总结（含 bot 回复） |
-| `WS_HEARTBEAT_TIMEOUT_MS` | 否 | `90000` | 多久没心跳强制重连 |
-| `WS_RECONNECT_DELAY_MS` | 否 | `3000` | 断线重连间隔 |
-
-> `SUMMARY_HOUR` 同时决定两件事：每天几点总结，以及上下文从几点开始算“新的一天”。例如 03:00 时逻辑日界是 03:00，凌晨 1–2 点的对话仍属于前一天，不会因为跨零点而失忆。
+> `data/` 整个目录被 gitignore。语料、会话、记忆、印象、翻译都不会上传到仓库。
 
 ## 目录结构
 
 ```text
-src/
-├── index.ts              # 启动、连接、风控串联、消息入库、组装依赖
-├── config.ts             # 环境变量读取与校验
-├── types.ts              # OneBot v11 最小类型 + 消息段转文本
-├── ws.ts                 # WS 连接、echo 配对、心跳、重连
-├── guard.ts              # 白名单/自身/去重/限流 + 串行发送队列
-├── llm.ts                # OpenAI 兼容客户端 + 本地 stub
-├── handler.ts            # 触发判断、上下文组装、工具调用、回复
-├── store/
-│   ├── db.ts             # node:sqlite、WAL、建表
-│   ├── messages.ts       # 消息读写、scope、逻辑日界
-│   └── memory.ts         # 记忆/印象 MD、memories 版本、cursor
-├── memory/
-│   └── summarizer.ts     # 定时/阈值总结，写 MD 并推进 cursor
-├── context/
-│   └── builder.ts        # 系统提示 + 今日对话 + 当前消息
-└── tools/
-    ├── registry.ts       # Tool 接口与注册表
-    ├── runner.ts         # function calling 循环、超时、错误回灌
-    └── builtin.ts        # update_impression / search_memory
+Tamaki/
+├── data/                           # 整个目录 gitignore
+│   ├── characters/<id>/
+│   │   ├── meta.json               # id / displayName / corpora 绑定
+│   │   ├── persona.md
+│   │   └── glossary.json
+│   ├── corpora/<corpus-id>/
+│   │   ├── meta.json
+│   │   ├── corpus.db               # lines + translations + line_meta
+│   │   ├── raw/adv/...             # 日文原始 CSV
+│   │   └── curated/<character>.csv # 精选注释（可选）
+│   └── runtime/                    # 全部可变运行时状态
+│       ├── bot.db                  # sessions + messages + memories + cursor
+│       ├── active-character.txt
+│       ├── logs/bot-YYYY-MM-DD.log
+│       └── <character>/
+│           ├── memory/group_*.md
+│           └── impressions/group_*.md
+│
+├── scripts/
+│   ├── import-corpus.ts
+│   └── translate-corpus.ts
+│
+└── src/
+    ├── character/
+    │   ├── loader.ts               # 扫描角色/语料库目录、active 选择、fallback
+    │   └── corpus.ts               # 单库查询 + 多库合并
+    ├── context/builder.ts
+    ├── store/
+    │   ├── db.ts                   # 单份 messages/sessions/memories/cursor
+    │   ├── messages.ts             # session 归属 + SQL 查询
+    │   ├── memory.ts               # 长期记忆 + memories 表
+    │   └── impressions.ts           # 群友印象 MD
+    ├── memory/summarizer.ts
+    ├── tools/
+    │   ├── registry.ts
+    │   ├── runner.ts
+    │   └── builtin.ts
+    ├── config.ts
+    ├── log.ts                    # 控制台 + 按天文件日志
+    ├── guard.ts
+    ├── handler.ts
+    ├── index.ts
+    ├── llm.ts
+    ├── types.ts
+    └── ws.ts
 ```
 
-运行数据：
+## 消息与会话
+
+`data/runtime/bot.db` 里：
+
+`messages` 通过 `is_self` 区分人类和 bot；提供 `human_messages` / `bot_messages` 两个视图，并加了 `(is_self, created_at)` 索引，不需要拆第二个数据库。
+
+```sql
+sessions(id, character_id, started_at, ended_at, last_seen_at)
+
+messages(
+  id, message_id, session_id, self_id, post_type, message_type,
+  group_id, user_id, nickname, is_self, raw_message, segments, created_at
+)
+
+memories(id, character_id, scope, version, content, created_at)
+summary_cursor(character_id, scope, last_ts)
+```
+
+- 启动时关闭上次遗留的 open session，然后给当前角色插入新 session
+- 运行中每 60 秒、以及每条消息到达时更新 `last_seen_at`
+- 退出时写 `ended_at`
+- 每条消息只写一行，带 `session_id`
+- 查上下文：
+
+```sql
+SELECT m.*
+FROM messages m
+JOIN sessions s ON s.id = m.session_id
+WHERE s.character_id = ?
+  AND m.group_id = ?
+  AND m.created_at >= ?
+ORDER BY m.created_at, m.id;
+```
+
+因此：
+
+- 角色只能看到自己 session 覆盖的群消息
+- 同一角色重启后继续用旧 session，历史连续
+- 换角色后，新角色看不到旧角色的在线期间
+- 崩溃时最多把最后 60 秒算作在线
+- 切换角色是启动时读 `data/runtime/active-character.txt`，需要重启
+
+## 记忆与印象
+
+两者是分开的：
+
+- **长期记忆（客观事实）**：`MemoryStore` 管，写在 `data/runtime/<character>/memory/*.md`，同时把版本写进 `bot.db.memories`；由 summarizer 更新，有 cursor。只记可核对的事件、约定、明确偏好，不写性格评价
+- **群友印象（主观判断）**：`ImpressionStore` 管，写在 `data/runtime/<character>/impressions/group_<gid>.md`，按群友小节维护；由 `update_impression` 工具更新，不写 `memories` 表。允许模糊、过时、被修正
+
+`context/builder.ts` 组装 prompt 时分别读 `## 长期记忆（客观事实）` 和 `## 群友印象（主观判断，可能不准确）`，不会混在一个文件里；回复时明确提醒印象只作参考。
+
+## 角色与语料库
+
+### 角色卡
+
+`data/characters/<id>/meta.json`：
+
+```json
+{
+  "id": "example",
+  "displayName": "示例角色",
+  "corpora": [
+    { "id": "example-corpus", "speakers": ["示例角色"] },
+    { "id": "another-corpus", "speakers": ["示例角色（别称）"] }
+  ],
+  "aliases": ["示例"],
+  "relations": {
+    "{user}": "制作人",
+    "角色A": "同龄",
+    "角色B": "年长"
+  }
+}
+```
+
+- `corpora`：一个角色可以绑定多个语料库，每个绑定有自己的 `speakers`
+- `speakers`：该语料库里属于这个角色的原始说话人名字
+- `aliases`：保留给后续使用，不自动触发
+- `relations`：把 `partner` 映射成 制作人/同龄/后辈/家人/对手/年长/粉丝/陌生人
+- `glossary.json`：翻译术语表
+
+`persona.md` 示例：
+
+```markdown
+# 角色
+
+你是示例角色。写身份、性格、说话方式、关系与边界。
+
+# 示例
+
+群友：今天怎么样？
+示例角色：还行，刚才在忙。
+```
+
+`glossary.json` 示例：
+
+```json
+{
+  "プロデューサー": "制作人",
+  "お金": "钱"
+}
+```
+
+### 语料库
+
+`data/corpora/<corpus-id>/`：
 
 ```text
-data/
-├── bot.db                        # SQLite（gitignored）
-├── persona.md                    # 人设（gitignored）
-├── memory/
-│   ├── group_{gid}.md            # 群记忆
-│   └── user_{uid}.md             # 私聊记忆
-└── impressions/
-    └── group_{gid}.md            # 群友印象簿
+meta.json       # 语料库元数据
+corpus.db       # lines / translations / line_meta
+raw/adv/...     # 日文原始 CSV
+curated/*.csv   # 精选注释
 ```
 
-## 消息处理流程
+`meta.json` 示例：
 
-```text
-WS 事件
-  └─ post_type === 'message'?
-       ├─ 自己发的        → 丢弃
-       ├─ 非白名单        → 丢弃
-       ├─ 5s 内重复 id    → 丢弃
-       ├─ 同用户超限流    → 丢弃
-       ├─ 入库（同步）
-       └─ handleMessage（异步）
-            ├─ 是否触发：@ / 引用 bot / 含昵称 / 管理员私聊
-            ├─ 组装上下文
-            ├─ runWithTools（最多 5 轮）
-            ├─ 串行队列发送
-            └─ 检查阈值并可能总结
+```json
+{
+  "id": "example-corpus",
+  "displayName": "示例语料库"
+}
 ```
 
-## 上下文与记忆规则
+`corpus.db` 表：
 
-每次组装上下文只放三部分：
-
-```text
-系统提示 = 人设 + 长期记忆 MD + 群友印象 MD
-历史消息 = 上次总结 cursor 之后的对话（没有 cursor 时回退到 SUMMARY_HOUR 逻辑日界）
-新消息   = 当前这条
+```sql
+lines(id, scene, seq, speaker, text_ja, scene_type, partner)
+translations(line_id, text_zh, source, model, updated_at)
+line_meta(line_id, relation, tags, emotion, note, kind)
 ```
 
-- 已总结进 MD 的对话不会再拼回上下文，避免重复计入
-- 记忆 + 印象默认截断到 1500 字，今日对话默认 4000 字，超出时从最新往回保留
-- 总结成功后才推进 cursor；总结失败时 cursor 不动，未总结对话继续留在上下文里
+- `lines`：从该语料库的 `raw/adv/**/*.csv` 导入，一行一条
+- `partner`：同场景最近的非本人说话人，用于推断关系
+- `line_meta`：精选台词的关系、标签、情绪、备注
+- `translations`：默认**留空**，由翻译脚本写入
+
+导入：
+
+```bash
+# 默认读 data/corpora/<id>/raw，写 data/corpora/<id>/corpus.db
+pnpm import:corpus -- --corpus example-corpus
+
+# 合并某角色的精选注释
+pnpm import:corpus -- --corpus example-corpus \
+  --curated data/corpora/example-corpus/curated/example.csv \
+  --character example
+```
+
+`--character` 会读取 `data/characters/<id>/meta.json` 中对应 corpus 的 `speakers`，用来匹配精选台词。
+
+### 多语料库检索
+
+- 每个 `CorpusStore` 只查自己的 DB
+- `CorpusLibrary` 把绑定的多个库的检索结果合并、按分数排序、按 `corpusId + 日文` 去重
+- `search_lines` 返回的每条结果都带 `corpusId`
+- 上下文按 `corpusId` 分发回对应语料库取前后行
+- 加新语料库 = 加一个 `data/corpora/<id>/` + 导入；角色 `corpora` 里加一条绑定
+
+## 翻译
+
+译文不存在仓库里，由脚本写入各语料库的 `translations` 表：
+
+```bash
+# 只查看会发什么，不调 API
+pnpm translate -- --character example --corpus example-corpus --dry-run
+
+# 实际翻译（需要 .env 里的 LLM_API_KEY）
+pnpm translate -- --character example --corpus example-corpus --batch 40
+pnpm translate -- --character example --corpus example-corpus --limit 100
+pnpm translate -- --character example --corpus example-corpus --force
+```
+
+- 角色只绑定一个 corpus 时 `--corpus` 可省略
+- 按绑定的 `speakers` 找缺失翻译
+- 同一句日文只翻一次，再映射回多个 line id
+- 每批写库，断点续跑
+- 术语表参与 prompt
+
+## 启动流程
+
+1. `loadCharacterRegistry()` 扫描 `CHARACTERS_DIR/*/meta.json`
+2. `loadCorpusRegistry()` 扫描 `CORPORA_DIR/*/meta.json`
+3. 读 `data/runtime/active-character.txt`
+4. 找不到 active 角色 → warn + 内置 fallback，不崩溃
+5. 打开 `data/runtime/bot.db`，关闭旧 session，开始新 session
+6. 按角色 `corpora` 绑定打开每个 `corpus.db`，构造 `CorpusLibrary`
+7. 构造 `CharacterRuntime`，把 persona/corpus/memory/session 一起交给 builder 和 tools
+
+## 日志
+
+- 控制台和文件同时输出
+- 文件：`data/runtime/logs/bot-YYYY-MM-DD.log`
+- 默认级别 `info`；`LOG_LEVEL=debug` 会记录每条消息的 ID/类型、工具调用、LLM 耗时等，但**不记录聊天正文**
+- `token / secret / password / authorization / api_key` 这类字段会被替换成 `[redacted]`
+- 默认保留最近 7 个按天文件；`LOG_RETENTION_DAYS=0` 表示不清理
+- `LOG_TO_FILE=0` 只输出控制台
+- `scripts/import-corpus.ts`、`scripts/translate-corpus.ts` 仍是 CLI 输出，不写运行日志
+
+## 配置
+
+| 变量 | 必填 | 默认值 | 说明 |
+|---|---|---|---|
+| `WS_URL` | 否 | `ws://127.0.0.1:3001` | NapCat 正向 WS 地址 |
+| `WS_TOKEN` | 否 | 空 | NapCat 的 access token，以 `Authorization: Bearer` 发送 |
+| `BOT_QQ` | 是 | — | 机器人 QQ |
+| `ADMIN_QQ` | 是 | — | 管理员 QQ |
+| `ALLOWED_GROUPS` | 是 | — | 允许的群号，逗号分隔 |
+| `BOT_NAME` | 否 | 空 | 机器人昵称；留空则从 `get_login_info` 获取 |
+| `LLM_API_KEY` | 是* | — | *`LLM_STUB=1` 时可不填 |
+| `LLM_BASE_URL` | 否 | `https://api.deepseek.com/v1` | OpenAI 兼容端点 |
+| `LLM_MODEL` | 否 | `deepseek-flash` | 模型名 |
+| `LLM_STUB` | 否 | `0` | 本地自测用，不发网络请求 |
+| `DATA_DIR` | 否 | `./data` | 运行时数据目录 |
+| `CHARACTERS_DIR` | 否 | `$DATA_DIR/characters` | 本地角色定义目录 |
+| `CORPORA_DIR` | 否 | `$DATA_DIR/corpora` | 本地语料库目录 |
+| `ACTIVE_CHARACTER_FILE` | 否 | `$DATA_DIR/runtime/active-character.txt` | 当前角色文件 |
+| `LOG_LEVEL` | 否 | `info` | `debug` / `info` / `warn` / `error` |
+| `LOG_DIR` | 否 | `$DATA_DIR/runtime/logs` | 日志目录 |
+| `LOG_TO_FILE` | 否 | `1` | 设为 `0` 只输出控制台 |
+| `LOG_RETENTION_DAYS` | 否 | `7` | 保留多少个按天日志；`0` 不清理 |
+| `TZ_NAME` | 否 | `Asia/Shanghai` | 时区 |
+| `SUMMARY_HOUR` | 否 | `3` | 定时总结小时，同时是上下文逻辑日界 |
+| `SUMMARY_THRESHOLD` | 否 | `200` | 单会话累计多少条触发即时总结 |
+| `WS_HEARTBEAT_TIMEOUT_MS` | 否 | `90000` | 心跳超时 |
+| `WS_RECONNECT_DELAY_MS` | 否 | `3000` | 重连间隔 |
+
+## 命令
+
+```bash
+pnpm start             # 启动
+pnpm mock              # 单独启动 mock NapCat（默认 3099）
+pnpm e2e               # 端到端自测（35 项断言）
+pnpm typecheck         # tsc --noEmit
+pnpm import:corpus     # 日文 CSV -> data/corpora/<id>/corpus.db
+pnpm translate         # 翻译缺失台词，写入 translations
+```
 
 ## 内置工具
 
 | 工具 | adminOnly | 说明 |
 |---|---|---|
-| `update_impression` | 否 | 按 `user_id` 更新当前群某个群友的印象小节 |
-| `search_memory` | 否 | 按关键词检索当前会话的长期记忆 |
+| `update_impression` | 否 | 更新当前角色对某个群友的主观印象小节 |
+| `search_memory` | 否 | 检索当前角色的长期记忆 |
+| `search_lines` | 否 | 跨角色绑定的多个语料库检索台词，返回原文/已有中文/关系/标签/corpusId |
 
-`adminOnly` 工具在 `listToolSchemas()` 阶段对非管理员不可见，执行前还会二次检查。项目本身不内置管理员专属工具，需要时可自行 `registerTool()`。
-
-## 自测
-
-```bash
-pnpm typecheck   # tsc --noEmit
-pnpm e2e         # mock NapCat + stub LLM，端到端 22 项断言
-pnpm mock        # 单独启动 mock NapCat（默认 3099）
-```
-
-`scripts/mock-napcat.ts` 模拟了 OneBot v11 的 action 响应、心跳、事件注入和断线；`scripts/e2e.ts` 覆盖白名单、自消息、去重、限流、串行发送、引用触发、私聊权限、上下文窗口、总结与 cursor、工具权限、token 请求头、重连和心跳超时。
+`adminOnly` 工具在 `listToolSchemas()` 阶段对非管理员不可见，执行前二次检查。
 
 ## 已知边界
 
-- 只实现用到的 OneBot v11 子集；未列出的消息段以宽松类型兜底
-- 去重和限流是内存状态，重启后清空
-- 同一时刻只支持一个 bot 实例；多实例需要各自独立的数据目录
-- 图片/语音等媒体由 NapCat 处理，本项目只透传消息段
-- 没有插件系统、事件总线、多平台适配器，这是刻意为之
+- 同一时刻只有一个 active character；切换需要重启
+- 角色只能看到自己在线期间的群消息；未激活期间的群聊不会进它的 DB
+- 崩溃收尾按最后心跳计算，最多误差 60 秒
+- 多语料库检索是关键词/子串 + 简单加权，不做语义检索
+- `tags`/`emotion` 主要来自精选注释；原始行通常只有 `partner`/`relation`
+- 翻译默认留空；不跑翻译脚本时中文检索只能命中已有 `text_zh`
+- 语料、译文、记忆、印象都不进 git；重新 clone 后需要重新导入
+- 没有插件系统、事件总线、多平台适配器
 
 ## License
 

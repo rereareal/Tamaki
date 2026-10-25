@@ -1,5 +1,8 @@
 import WebSocket from 'ws';
 import type { OneBotEvent } from './types';
+import { logger } from './log';
+
+const log = logger.child('ws');
 
 interface Pending {
   resolve: (data: any) => void;
@@ -49,6 +52,7 @@ export class NapCatClient {
     this.ws = ws;
 
     ws.on('open', () => {
+      log.debug('connected');
       this.lastHeartbeat = Date.now();
       this.startHeartbeatWatch();
       this.onOpen?.();
@@ -58,15 +62,16 @@ export class NapCatClient {
       try {
         this.handleFrame(raw.toString());
       } catch (err) {
-        console.error('[ws] bad frame:', (err as Error).message);
+        log.warn('bad frame', { error: (err as Error).message });
       }
     });
 
     ws.on('error', (err) => {
-      if (!this.closedByUser) console.error('[ws] error:', err.message);
+      if (!this.closedByUser) log.warn('websocket error', { error: err.message });
     });
 
-    ws.on('close', () => {
+    ws.on('close', (code) => {
+      log.debug('closed', { code });
       this.stopHeartbeatWatch();
       this.rejectAll(new Error('websocket closed'));
       this.onClose?.();
@@ -127,7 +132,7 @@ export class NapCatClient {
     const tick = Math.min(10_000, Math.max(250, Math.floor(timeout / 3)));
     this.heartbeatTimer = setInterval(() => {
       if (Date.now() - this.lastHeartbeat > timeout) {
-        console.error('[ws] heartbeat timeout, reconnecting');
+        log.warn('heartbeat timeout, reconnecting');
         this.ws?.terminate();
       }
     }, tick);
@@ -143,7 +148,7 @@ export class NapCatClient {
     const delay = this.opts.reconnectDelayMs ?? 3_000;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
-      console.log('[ws] reconnecting...');
+      log.info('reconnecting');
       this.connect();
     }, delay);
   }

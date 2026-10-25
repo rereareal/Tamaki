@@ -4,10 +4,15 @@ import type { NapCatClient } from './ws';
 import type { MessageStore } from './store/messages';
 import { scopeOf } from './store/messages';
 import type { MemoryStore } from './store/memory';
+import type { ImpressionStore } from './store/impressions';
 import { buildContextMessages } from './context/builder';
 import type { LLMCall } from './tools/runner';
 import { runWithTools } from './tools/runner';
 import type { ToolContext } from './tools/registry';
+import type { CharacterRuntime } from './character/loader';
+import { logger } from './log';
+
+const log = logger.child('handler');
 
 export type ReplyFn = (evt: MessageEvent, segments: MessageSegment[]) => Promise<void>;
 
@@ -15,12 +20,13 @@ export interface HandlerDeps {
   client: NapCatClient;
   store: MessageStore;
   memory: MemoryStore;
+  impressions: ImpressionStore;
   callLLM: LLMCall;
   reply: ReplyFn;
   adminQQ: number;
   botQQ: number;
   getBotName: () => string;
-  getPersona: () => string;
+  character: CharacterRuntime;
   timeZone: string;
 }
 
@@ -56,7 +62,12 @@ export async function shouldRespond(evt: MessageEvent, deps: HandlerDeps): Promi
 }
 
 export async function handleMessage(evt: MessageEvent, deps: HandlerDeps): Promise<void> {
-  if (!(await shouldRespond(evt, deps))) return;
+  if (!(await shouldRespond(evt, deps))) {
+    log.debug('not triggered', { messageId: evt.message_id, messageType: evt.message_type });
+    return;
+  }
+
+  log.debug('handling', { messageId: evt.message_id, messageType: evt.message_type });
 
   const botName = deps.getBotName();
   const ctx: ToolContext = {
@@ -65,22 +76,29 @@ export async function handleMessage(evt: MessageEvent, deps: HandlerDeps): Promi
     scope: scopeOf(evt),
     store: deps.store,
     memory: deps.memory,
+    impressions: deps.impressions,
     botQQ: deps.botQQ,
     botName,
+    character: deps.character,
     reply: (segments) => deps.reply(evt, segments),
   };
 
   const built = buildContextMessages(evt, {
     store: deps.store,
     memory: deps.memory,
-    persona: deps.getPersona(),
+    impressions: deps.impressions,
+    character: deps.character,
     botQQ: deps.botQQ,
     botName,
     timeZone: deps.timeZone,
   });
 
   const answer = await runWithTools(built.messages, ctx, deps.callLLM, 5);
-  if (!answer) return;
+  if (!answer) {
+    log.debug('empty answer', { messageId: evt.message_id });
+    return;
+  }
+  log.debug('answer ready', { messageId: evt.message_id, length: answer.length });
 
   await deps.reply(evt, [{ type: 'text', data: { text: answer } }]);
 }

@@ -5,6 +5,7 @@ import { segmentsToText } from '../types';
 export interface MessageRow {
   id: number;
   message_id: number;
+  session_id: number;
   self_id: number;
   post_type: string;
   message_type: 'group' | 'private';
@@ -109,13 +110,54 @@ export function rowToSegments(row: MessageRow): MessageSegment[] {
   return parseSegments(row.segments);
 }
 
+/* ------------------------------------------------------------------ */
+/* sessions：消息只存一份，靠 session 归属限制「角色在线期间」           */
+/* ------------------------------------------------------------------ */
+
+/** 启动时调用：把上次进程遗留的未关闭 session 按最后心跳时间收尾。 */
+export function closeStaleSessions(db: Db): number {
+  const res = db
+    .prepare('UPDATE sessions SET ended_at = COALESCE(last_seen_at, started_at) WHERE ended_at IS NULL')
+    .run();
+  return Number(res.changes);
+}
+
+export function startSession(db: Db, characterId: string, now = Date.now()): number {
+  const res = db
+    .prepare('INSERT INTO sessions (character_id, started_at, ended_at, last_seen_at) VALUES (?, ?, NULL, ?)')
+    .run(characterId, now, now);
+  return Number(res.lastInsertRowid);
+}
+
 export class MessageStore {
   constructor(
     private readonly db: Db,
     private readonly timeZone: string,
     /** 与 summarizer 的定时小时保持一致，作为逻辑日界。 */
     private readonly summaryHour: number,
+    private readonly characterId: string,
+    private readonly sessionId: number,
   ) {}
+
+  get currentSessionId(): number {
+    return this.sessionId;
+  }
+
+  get currentCharacterId(): string {
+    return this.characterId;
+  }
+
+  touchSession(now = Date.now()): void {
+    this.db
+      .prepare('UPDATE sessions SET last_seen_at = ? WHERE id = ? AND ended_at IS NULL')
+      .run(now, this.sessionId);
+  }
+
+  endSession(now = Date.now()): void {
+    this.db
+      .prepare('UPDATE sessions SET ended_at = COALESCE(ended_at, ?), last_seen_at = ? WHERE id = ?')
+      .run(now, now, this.sessionId);
+  }
 
   saveMessage(evt: MessageEvent): void {
     const nickname = evt.sender?.card || evt.sender?.nickname || String(evt.user_id);
@@ -171,12 +213,13 @@ export class MessageStore {
     this.db
       .prepare(
         `INSERT INTO messages
-         (message_id, self_id, post_type, message_type, group_id, user_id, nickname,
+         (message_id, session_id, self_id, post_type, message_type, group_id, user_id, nickname,
           is_self, raw_message, segments, created_at)
-         VALUES (?, ?, 'message', ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, 'message', ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         m.messageId,
+        this.sessionId,
         m.selfId,
         m.messageType,
         m.groupId,
@@ -190,82 +233,81 @@ export class MessageStore {
   }
 
   /**
-   * 当天上下文：下界优先用已总结 cursor；没有 cursor 时回退到最近一次逻辑日界。
-   * 这样 00:00~SUMMARY_HOUR 之间不会因为跨零点而丢失前一天尚未总结的对话。
-   * 已总结进记忆的对话仍然不会重放。
+   * 上下文下界：已总结 cursor 优先；没有 cursor 时回退到 SUMMARY_HOUR 逻辑日界。
+   * JOIN sessions 后，只有当前角色在线期间的消息可见。
    */
   getContextMessages(scope: Scope, excludeMessageId?: number, now = Date.now()): MessageRow[] {
     const cursor = this.getCursor(scope);
     const boundary = startOfLogicalDay(now, this.summaryHour, this.timeZone);
     const since = cursor > 0 ? cursor : boundary;
     const { kind, id } = parseScope(scope);
-    const cond = kind === 'group' ? 'group_id = ?' : "user_id = ? AND message_type = 'private'";
-    let sql = `SELECT * FROM messages WHERE ${cond} AND created_at >= ?`;
-    if (excludeMessageId !== undefined) sql += ' AND message_id != ?';
-    sql += ' ORDER BY created_at ASC, id ASC';
+    const cond = kind === 'group' ? 'm.group_id = ?' : "m.user_id = ? AND m.message_type = 'private'";
 
-    // 参数顺序与 SQL 占位符一致：scope 条件 -> since -> 排除的 message_id
-    const params: (number | string)[] = [id, since];
-    if (excludeMessageId !== undefined) params.push(excludeMessageId);
+    let sql = `SELECT m.* FROM messages m
+      JOIN sessions s ON s.id = m.session_id
+      WHERE s.character_id = ? AND ${cond} AND m.created_at >= ?`;
+    const params: (number | string)[] = [this.characterId, id, since];
+    if (excludeMessageId !== undefined) {
+      sql += ' AND m.message_id != ?';
+      params.push(excludeMessageId);
+    }
+    sql += ' ORDER BY m.created_at ASC, m.id ASC';
     return this.db.prepare(sql).all(...params) as unknown as MessageRow[];
   }
 
   getMessagesBetween(scope: Scope, afterTs: number, endTs: number): MessageRow[] {
     const { kind, id } = parseScope(scope);
-    if (kind === 'group') {
-      return this.db
-        .prepare(
-          `SELECT * FROM messages
-           WHERE group_id = ? AND created_at > ? AND created_at <= ?
-           ORDER BY created_at ASC, id ASC`,
-        )
-        .all(id, afterTs, endTs) as unknown as MessageRow[];
-    }
+    const cond = kind === 'group' ? 'm.group_id = ?' : "m.user_id = ? AND m.message_type = 'private'";
     return this.db
       .prepare(
-        `SELECT * FROM messages
-         WHERE message_type = 'private' AND user_id = ? AND created_at > ? AND created_at <= ?
-         ORDER BY created_at ASC, id ASC`,
+        `SELECT m.* FROM messages m
+         JOIN sessions s ON s.id = m.session_id
+         WHERE s.character_id = ? AND ${cond} AND m.created_at > ? AND m.created_at <= ?
+         ORDER BY m.created_at ASC, m.id ASC`,
       )
-      .all(id, afterTs, endTs) as unknown as MessageRow[];
+      .all(this.characterId, id, afterTs, endTs) as unknown as MessageRow[];
   }
 
   countSince(scope: Scope, afterTs: number): number {
     const { kind, id } = parseScope(scope);
-    const row =
-      kind === 'group'
-        ? this.db.prepare('SELECT COUNT(*) AS n FROM messages WHERE group_id = ? AND created_at > ?').get(id, afterTs)
-        : this.db
-            .prepare("SELECT COUNT(*) AS n FROM messages WHERE message_type = 'private' AND user_id = ? AND created_at > ?")
-            .get(id, afterTs);
-    return Number((row as { n: number } | undefined)?.n ?? 0);
+    const cond = kind === 'group' ? 'm.group_id = ?' : "m.user_id = ? AND m.message_type = 'private'";
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM messages m
+         JOIN sessions s ON s.id = m.session_id
+         WHERE s.character_id = ? AND ${cond} AND m.created_at > ?`,
+      )
+      .get(this.characterId, id, afterTs) as { n: number } | undefined;
+    return Number(row?.n ?? 0);
   }
 
   listScopes(): Scope[] {
     const rows = this.db
       .prepare(
         `SELECT DISTINCT
-           CASE WHEN message_type = 'group' THEN 'group:' || group_id
-                ELSE 'private:' || user_id END AS scope
-         FROM messages`,
+           CASE WHEN m.message_type = 'group' THEN 'group:' || m.group_id
+                ELSE 'private:' || m.user_id END AS scope
+         FROM messages m
+         JOIN sessions s ON s.id = m.session_id
+         WHERE s.character_id = ?`,
       )
-      .all() as unknown as { scope: string }[];
+      .all(this.characterId) as unknown as { scope: string }[];
     return rows.map((r) => r.scope as Scope);
   }
 
   getCursor(scope: Scope): number {
-    const row = this.db.prepare('SELECT last_ts FROM summary_cursor WHERE scope = ?').get(scope) as
-      | { last_ts: number }
-      | undefined;
+    const row = this.db
+      .prepare('SELECT last_ts FROM summary_cursor WHERE character_id = ? AND scope = ?')
+      .get(this.characterId, scope) as { last_ts: number } | undefined;
     return Number(row?.last_ts ?? 0);
   }
 
   setCursor(scope: Scope, ts: number): void {
     this.db
       .prepare(
-        `INSERT INTO summary_cursor (scope, last_ts) VALUES (?, ?)
-         ON CONFLICT(scope) DO UPDATE SET last_ts = excluded.last_ts`,
+        `INSERT INTO summary_cursor (character_id, scope, last_ts) VALUES (?, ?, ?)
+         ON CONFLICT(character_id, scope) DO UPDATE SET last_ts = excluded.last_ts`,
       )
-      .run(scope, ts);
+      .run(this.characterId, scope, ts);
   }
 }

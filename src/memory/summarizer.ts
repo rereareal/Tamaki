@@ -3,17 +3,29 @@ import type { MessageStore, Scope } from '../store/messages';
 import { formatClock, rowToSegments, zonedParts } from '../store/messages';
 import { segmentsToText } from '../types';
 import type { ChatMessage, LLMCall } from '../tools/runner';
+import { logger } from '../log';
+
+const log = logger.child('summary');
 
 export interface SummarizerOptions {
   timeZone: string;
   hour: number;
   threshold: number;
+  characterName?: string;
 }
 
-const SUMMARY_SYSTEM =
-  '你是记忆整理器。阅读「现有记忆」和「新增对话」，输出更新后的完整记忆正文。' +
-  '要求：800 字以内；保留偏好、约定、关键事件、人物关系；丢弃寒暄、重复和一次性闲聊；' +
-  '只输出记忆正文，不要标题、不要解释、不要代码块。';
+function summarySystem(characterName?: string): string {
+  return (
+    `你是记忆整理器${characterName ? `，正在为角色「${characterName}」整理群聊记忆` : ''}。` +
+    '阅读「现有记忆」和「新增对话」，输出更新后的完整记忆正文。' +
+    '只记录可核对的事实：谁说了什么、约定、事件、明确表达过的偏好、时间/人物。' +
+    '不写性格评价、动机猜测、情绪判断；不写「某人很温柔/不靠谱」这类主观结论。' +
+    '用「X 表示/提到/答应……」归因，不替对方下结论；无法确认的内容不要写。' +
+    'bot 自己的话只保留明确承诺或约定，其余不复述。' +
+    '800 字以内；丢弃寒暄、重复和一次性闲聊；' +
+    '只输出记忆正文，不要标题、不要解释、不要代码块。'
+  );
+}
 
 export class Summarizer {
   private locks = new Map<string, Promise<boolean>>();
@@ -47,7 +59,7 @@ export class Summarizer {
       try {
         await this.summarizeScope(scope);
       } catch (err) {
-        console.error(`[summary] ${scope} failed:`, (err as Error).message);
+        log.error('scope summary failed', err, { scope });
       }
     }
   }
@@ -61,7 +73,7 @@ export class Summarizer {
       if (p.hour !== this.opts.hour || p.minute !== 0) return;
       if (this.lastDaily === dateKey) return;
       this.lastDaily = dateKey;
-      console.log('[summary] daily run', dateKey);
+      log.info('daily run', { date: dateKey });
       void this.summarizeAll();
     }, 30_000);
     timer.unref?.();
@@ -87,7 +99,7 @@ export class Summarizer {
 
     const old = this.memory.loadMemory(scope);
     const messages: ChatMessage[] = [
-      { role: 'system', content: SUMMARY_SYSTEM },
+      { role: 'system', content: summarySystem(this.opts.characterName) },
       {
         role: 'user',
         content: `【现有记忆】\n${old || '（空）'}\n\n【新增对话】\n${transcript}`,
@@ -104,7 +116,7 @@ export class Summarizer {
 
     this.memory.saveMemory(scope, content.slice(0, 1600));
     this.store.setCursor(scope, end);
-    console.log(`[summary] ${scope}: ${rows.length} messages -> memory v${this.memory.memoryVersions(scope)}`);
+    log.info('summarized', { scope, messages: rows.length, version: this.memory.memoryVersions(scope) });
     return true;
   }
 }
