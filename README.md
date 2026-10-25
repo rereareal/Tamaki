@@ -80,7 +80,9 @@ Tamaki/
 │
 ├── scripts/
 │   ├── import-corpus.ts
-│   └── translate-corpus.ts
+│   ├── translate-corpus.ts
+│   ├── mock-napcat.ts
+│   └── e2e.ts
 │
 └── src/
     ├── character/
@@ -91,14 +93,14 @@ Tamaki/
     │   ├── db.ts                   # 单份 messages/sessions/memories/cursor
     │   ├── messages.ts             # session 归属 + SQL 查询
     │   ├── memory.ts               # 长期记忆 + memories 表
-    │   └── impressions.ts           # 群友印象 MD
+    │   └── impressions.ts          # 群友印象 MD
     ├── memory/summarizer.ts
     ├── tools/
     │   ├── registry.ts
     │   ├── runner.ts
     │   └── builtin.ts
     ├── config.ts
-    ├── log.ts                    # 控制台 + 按天文件日志
+    ├── log.ts                     # 控制台 + 按天文件日志
     ├── guard.ts
     ├── handler.ts
     ├── index.ts
