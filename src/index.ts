@@ -21,6 +21,7 @@ import {
 import { openCorpusLibrary } from './character/corpus';
 import type { MessageEvent, MessageSegment } from './types';
 import { configureLogger, logger } from './log';
+import { ProactiveGate } from './proactive';
 
 const log = logger.child('app');
 
@@ -98,6 +99,16 @@ export function start(opts: StartOptions = {}): Tamaki {
     });
   }
 
+  const proactive = new ProactiveGate(config.proactive);
+  log.info('proactive config', {
+    enabled: proactive.enabled,
+    chance: config.proactive.chance,
+    idleMs: config.proactive.idleMs,
+    cooldownMs: config.proactive.cooldownMs,
+    maxPerHour: config.proactive.maxPerHour,
+    groups: config.proactive.groups,
+  });
+
   const character: CharacterRuntime = {
     ...definition,
     corpus,
@@ -148,6 +159,7 @@ export function start(opts: StartOptions = {}): Tamaki {
 
       const data = await client.callAction<{ message_id?: number }>(action, params);
       log.debug('reply sent', { messageId: data?.message_id, messageType: evt.message_type });
+      if (evt.group_id !== undefined) proactive.noteBotMessage(evt.group_id);
       store.saveOutbound({
         messageId: data?.message_id,
         selfId: config.botQQ,
@@ -172,6 +184,7 @@ export function start(opts: StartOptions = {}): Tamaki {
     botQQ: config.botQQ,
     getBotName: () => botName,
     character,
+    proactive,
     timeZone: config.timeZone,
   };
 

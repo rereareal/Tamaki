@@ -9,7 +9,8 @@
     "e2e": "tsx scripts/e2e.ts",
     "typecheck": "tsc --noEmit",
     "import:corpus": "tsx scripts/import-corpus.ts",
-    "translate": "node --env-file-if-exists=.env --import tsx scripts/translate-corpus.ts"
+    "translate": "node --env-file-if-exists=.env --import tsx scripts/translate-corpus.ts",
+    "run": "bash scripts/run-tamaki.sh"
   },
   "dependencies": {
     "openai": "^4.104.0",

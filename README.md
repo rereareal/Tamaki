@@ -56,6 +56,64 @@ NapCat 侧需要：
 
 > `data/` 整个目录被 gitignore。语料、会话、记忆、印象、翻译都不会上传到仓库。
 
+## Podman + tmux 部署
+
+NapCat 用 Podman 跑，Tamaki 直接跑代码，用 tmux 常驻。
+
+```bash
+# 1. 安装运行依赖（Debian 12）
+apt-get update && apt-get install -y podman-compose rsync tmux xz-utils
+
+# 2. 导入本地保存的 NapCat 镜像
+podman load -i napcat.tar
+
+# 3. 建目录和 .env
+mkdir -p napcat/qq napcat/config napcat/plugins
+cp .env.example .env
+# 编辑 .env：
+#   BOT_QQ / ADMIN_QQ / ALLOWED_GROUPS / LLM_API_KEY
+#   NAPCAT_WEBUI_TOKEN（NapCat WebUI 登录口令）
+#   WS_TOKEN（NapCat 正向 WS token，两边必须一致）
+
+# 4. 启动 NapCat
+podman-compose up -d napcat
+
+# 5. 安装 Node 24 + pnpm（示例路径）
+curl -fsSLO https://mirrors.aliyun.com/nodejs-release/v24.22.1/node-v24.22.1-linux-x64.tar.xz
+tar -xJf node-v24.22.1-linux-x64.tar.xz -C /opt
+ln -sf /opt/node-v24.22.1-linux-x64/bin/node /usr/local/bin/node
+ln -sf /opt/node-v24.22.1-linux-x64/bin/npm /usr/local/bin/npm
+ln -sf /opt/node-v24.22.1-linux-x64/bin/npx /usr/local/bin/npx
+npm install -g pnpm@12
+
+# 6. 安装依赖并启动 Tamaki
+pnpm install --frozen-lockfile
+tmux new-session -d -s tamaki 'cd /opt/tamaki && bash scripts/run-tamaki.sh'
+```
+
+说明：
+
+- NapCat WebUI 只绑 `127.0.0.1:6099`，远程用 SSH 转发：
+  ```bash
+  ssh -L 6099:127.0.0.1:6099 root@<server>
+  ```
+  打开 `http://127.0.0.1:6099/webui`，用 `NAPCAT_WEBUI_TOKEN` 登录。
+- 首次登录 QQ 后，在 NapCat WebUI 的「网络配置 → WebSocket 服务器」里设置：
+  - host：`0.0.0.0`
+  - port：`3001`
+  - token：与 `.env` 的 `WS_TOKEN` 相同
+  - message format：`array`
+  - heartbeat：`30000`
+- Tamaki 通过宿主机 `127.0.0.1:3001` 连接 NapCat，所以 `.env` 保持 `WS_URL=ws://127.0.0.1:3001`。
+- 查看 Tamaki：
+  ```bash
+  tmux attach -t tamaki
+  tail -f data/runtime/logs/bot-*.log
+  ```
+- 数据持久化在 `./data` 和 `./napcat`。
+- `scripts/run-tamaki.sh` 会在进程退出后 5 秒自动重启。
+- `napcat.tar` 和 `napcat/` 已加入 `.gitignore`，不会提交。
+
 ## 目录结构
 
 ```text
@@ -82,7 +140,8 @@ Tamaki/
 │   ├── import-corpus.ts
 │   ├── translate-corpus.ts
 │   ├── mock-napcat.ts
-│   └── e2e.ts
+│   ├── e2e.ts
+│   └── run-tamaki.sh
 │
 └── src/
     ├── character/
@@ -100,6 +159,7 @@ Tamaki/
     │   ├── runner.ts
     │   └── builtin.ts
     ├── config.ts
+    ├── proactive.ts               # P1 主动发言门控
     ├── log.ts                     # 控制台 + 按天文件日志
     ├── guard.ts
     ├── handler.ts
@@ -241,8 +301,8 @@ line_meta(line_id, relation, tags, emotion, note, kind)
 
 - `lines`：从该语料库的 `raw/adv/**/*.csv` 导入，一行一条
 - `partner`：同场景最近的非本人说话人，用于推断关系
-- `line_meta`：精选台词的关系、标签、情绪、备注
-- `translations`：默认**留空**，由翻译脚本写入
+- `line_meta`：关系、标签、情绪、备注；精选台词自带，全量翻译时会为每条台词补 1–3 个标签
+- `translations`：精选 CSV 的人工中文会先导入；其余由翻译脚本写入
 
 导入：
 
@@ -266,6 +326,35 @@ pnpm import:corpus -- --corpus example-corpus \
 - 上下文按 `corpusId` 分发回对应语料库取前后行
 - 加新语料库 = 加一个 `data/corpora/<id>/` + 导入；角色 `corpora` 里加一条绑定
 
+### 每次回答前强制 search_lines
+
+只要当前角色有可用语料库，`handler` 会在调用 LLM 前由代码强制执行一次 `search_lines`：
+
+- `keyword`：当前消息文本（去掉 @ 和引用段）
+- `tags`：从中文主题词推断（金钱/家人/被夸/生气等）
+- `limit`：5
+- 结果作为系统提示里的 `## 预检索台词（只借语感）` 注入
+- 不伪造 `assistant(tool_calls)`，因为 thinking mode 的 provider 要求 assistant 消息带回 `reasoning_content`，伪造会 400
+- 如果本次已预执行，system prompt 会提醒模型不要重复调用 search_lines
+- 同时跳过 system prompt 里的【参考台词】注入，避免重复
+
+没有语料库或消息为空时跳过。
+
+### 参考台词注入
+
+
+`buildReferences()` 先按当前消息做文本检索；如果没有命中，会把中文主题词映射成 tags，再从 `line_meta.tags` 里检索。默认最多注入 5 条，预算 1000 字。
+
+```text
+钱/工资/请客 → 金钱、被请客、被说贪钱
+夸/可爱       → 被夸外貌、被夸能力
+家人/妹妹     → 聊家人、家人
+偶像/梦想     → 梦想
+生气/凶       → 生气
+```
+
+这样即使中文消息没有逐字命中译文，也能按主题拿到真实台词。
+
 ## 翻译
 
 译文不存在仓库里，由脚本写入各语料库的 `translations` 表：
@@ -275,7 +364,7 @@ pnpm import:corpus -- --corpus example-corpus \
 pnpm translate -- --character example --corpus example-corpus --dry-run
 
 # 实际翻译（需要 .env 里的 LLM_API_KEY）
-pnpm translate -- --character example --corpus example-corpus --batch 40
+pnpm translate -- --character example --corpus example-corpus --batch 40 --concurrency 3
 pnpm translate -- --character example --corpus example-corpus --limit 100
 pnpm translate -- --character example --corpus example-corpus --force
 ```
@@ -283,6 +372,7 @@ pnpm translate -- --character example --corpus example-corpus --force
 - 角色只绑定一个 corpus 时 `--corpus` 可省略
 - 按绑定的 `speakers` 找缺失翻译
 - 同一句日文只翻一次，再映射回多个 line id
+- 同时生成 1–3 个 tags 和简短 emotion，写入 `line_meta`
 - 每批写库，断点续跑
 - 术语表参与 prompt
 
@@ -295,6 +385,29 @@ pnpm translate -- --character example --corpus example-corpus --force
 5. 打开 `data/runtime/bot.db`，关闭旧 session，开始新 session
 6. 按角色 `corpora` 绑定打开每个 `corpus.db`，构造 `CorpusLibrary`
 7. 构造 `CharacterRuntime`，把 persona/corpus/memory/session 一起交给 builder 和 tools
+
+## 主动发言（P1）
+
+默认关闭。开启后不是每条都回，而是满足以下条件才允许对普通群消息插话：
+
+- 当前群在 `PROACTIVE_GROUPS`（默认等于 `ALLOWED_GROUPS`）
+- bot 在该群已经 `PROACTIVE_IDLE_MS` 没说话
+- 距上次主动插话超过 `PROACTIVE_COOLDOWN_MS`
+- 该群最近一小时主动插话次数小于 `PROACTIVE_MAX_PER_HOUR`
+- 文本长度至少 `PROACTIVE_MIN_TEXT_LENGTH`（避免对表情/短语气词插话）
+- `Math.random() < PROACTIVE_CHANCE`
+
+```env
+PROACTIVE_ENABLED=1
+PROACTIVE_CHANCE=0.05
+PROACTIVE_IDLE_MS=600000          # 10 分钟
+PROACTIVE_COOLDOWN_MS=1800000     # 30 分钟
+PROACTIVE_MAX_PER_HOUR=3
+PROACTIVE_MIN_TEXT_LENGTH=6
+# PROACTIVE_GROUPS=123456789
+```
+
+主动插话时会在系统提示里加一句“只回一句，不要追问，不要总结”，避免它把普通聊天当成提问长篇回答。
 
 ## 日志
 
@@ -324,6 +437,13 @@ pnpm translate -- --character example --corpus example-corpus --force
 | `CHARACTERS_DIR` | 否 | `$DATA_DIR/characters` | 本地角色定义目录 |
 | `CORPORA_DIR` | 否 | `$DATA_DIR/corpora` | 本地语料库目录 |
 | `ACTIVE_CHARACTER_FILE` | 否 | `$DATA_DIR/runtime/active-character.txt` | 当前角色文件 |
+| `PROACTIVE_ENABLED` | 否 | `0` | 开启 P1 主动发言 |
+| `PROACTIVE_CHANCE` | 否 | `0.05` | 每次空闲消息的插话概率 |
+| `PROACTIVE_IDLE_MS` | 否 | `600000` | 多久没说话才考虑插话 |
+| `PROACTIVE_COOLDOWN_MS` | 否 | `1800000` | 两次主动插话的最小间隔 |
+| `PROACTIVE_MAX_PER_HOUR` | 否 | `3` | 每群每小时主动插话上限 |
+| `PROACTIVE_MIN_TEXT_LENGTH` | 否 | `6` | 太短的消息不插话 |
+| `PROACTIVE_GROUPS` | 否 | `ALLOWED_GROUPS` | 允许主动插话的群 |
 | `LOG_LEVEL` | 否 | `info` | `debug` / `info` / `warn` / `error` |
 | `LOG_DIR` | 否 | `$DATA_DIR/runtime/logs` | 日志目录 |
 | `LOG_TO_FILE` | 否 | `1` | 设为 `0` 只输出控制台 |
@@ -339,7 +459,7 @@ pnpm translate -- --character example --corpus example-corpus --force
 ```bash
 pnpm start             # 启动
 pnpm mock              # 单独启动 mock NapCat（默认 3099）
-pnpm e2e               # 端到端自测（35 项断言）
+pnpm e2e               # 端到端自测（40 项断言）
 pnpm typecheck         # tsc --noEmit
 pnpm import:corpus     # 日文 CSV -> data/corpora/<id>/corpus.db
 pnpm translate         # 翻译缺失台词，写入 translations
@@ -352,8 +472,14 @@ pnpm translate         # 翻译缺失台词，写入 translations
 | `update_impression` | 否 | 更新当前角色对某个群友的主观印象小节 |
 | `search_memory` | 否 | 检索当前角色的长期记忆 |
 | `search_lines` | 否 | 跨角色绑定的多个语料库检索台词，返回原文/已有中文/关系/标签/corpusId |
+| `web_search` | 否 | 调 DeepSeek `/v1/tools/search` 联网搜索，返回标题/URL/摘要/站点/时间/权威性；网页内容按不可信数据处理 |
+| `web_fetch` | 否 | 调 DeepSeek `/v1/tools/fetch` 抓单个网页，返回 Markdown 正文；仅用于摘要不足或核对原文 |
 
 `adminOnly` 工具在 `listToolSchemas()` 阶段对非管理员不可见，执行前二次检查。
+
+### web_search
+
+与 pi 的 `deepseek-search` 扩展同一组接口：`POST <LLM_BASE_URL>/tools/search` 和 `/tools/fetch`，复用 `LLM_API_KEY`。可用 `SEARCH_API_URL` / `FETCH_API_URL` / `SEARCH_API_KEY` 覆盖。搜索默认最多 8 条、摘要截断 800 字；抓取正文截断 8000 字；结果里的指令不执行。
 
 ## 已知边界
 
@@ -361,9 +487,10 @@ pnpm translate         # 翻译缺失台词，写入 translations
 - 角色只能看到自己在线期间的群消息；未激活期间的群聊不会进它的 DB
 - 崩溃收尾按最后心跳计算，最多误差 60 秒
 - 多语料库检索是关键词/子串 + 简单加权，不做语义检索
-- `tags`/`emotion` 主要来自精选注释；原始行通常只有 `partner`/`relation`
-- 翻译默认留空；不跑翻译脚本时中文检索只能命中已有 `text_zh`
+- `tags`/`emotion` 来自精选注释 + 翻译时生成的标签；没跑全量翻译前只有精选行有
+- 不跑翻译脚本时，中文检索只能命中精选 CSV 导入的 52 条
 - 语料、译文、记忆、印象都不进 git；重新 clone 后需要重新导入
+- 本项目不强制 `tool_choice`；部分 provider 的 thinking 模式不支持强制指定，只支持 `auto`，所以统一使用默认 `auto`
 - 没有插件系统、事件总线、多平台适配器
 
 ## License

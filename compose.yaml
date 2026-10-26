@@ -1,0 +1,22 @@
+version: "3.8"
+
+services:
+  napcat:
+    # 由本地 napcat.tar 通过 podman load 导入
+    image: docker.io/mlikiowa/napcat-docker:latest
+    container_name: napcat
+    restart: always
+    environment:
+      MODE: ws
+      WEBUI_TOKEN: ${NAPCAT_WEBUI_TOKEN:-change-me}
+      NAPCAT_UID: ${NAPCAT_UID:-0}
+      NAPCAT_GID: ${NAPCAT_GID:-0}
+      TZ: ${TZ_NAME:-Asia/Shanghai}
+    ports:
+      # WebUI 和 OneBot WS 都只绑本机；远程 WebUI 用 SSH 转发
+      - "127.0.0.1:6099:6099"
+      - "127.0.0.1:3001:3001"
+    volumes:
+      - ./napcat/qq:/app/.config/QQ
+      - ./napcat/config:/app/napcat/config
+      - ./napcat/plugins:/app/napcat/plugins

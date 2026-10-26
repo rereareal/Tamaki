@@ -66,7 +66,7 @@ export async function runWithTools(
     for (const call of calls) {
       const name = call.function?.name ?? '';
       const tool = getTool(name);
-      log.debug('tool call', { name, round: round + 1 });
+      log.info('tool call', { name, round: round + 1 });
       let payload: string;
 
       try {

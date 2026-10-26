@@ -12,6 +12,35 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { CharacterMeta } from '../src/character/loader';
 
+const TAG_SET = [
+  '被夸外貌',
+  '被夸能力',
+  '被请客',
+  '被说贪钱',
+  '被轻视',
+  '生气',
+  '对方脱线',
+  '聊家人',
+  '金钱',
+  '工作',
+  '家人',
+  '梦想',
+  '吐槽',
+  '拒绝帮助',
+  '撒娇',
+  '嘴硬',
+  '自嘲',
+  '得意',
+  '关心',
+  '害羞',
+  '抱怨',
+  '道歉',
+  '鼓励',
+  '惊讶',
+  '日常',
+];
+const TAG_SET_INDEX = new Set(TAG_SET);
+
 function arg(name: string, fallback?: string): string | undefined {
   const idx = process.argv.indexOf(`--${name}`);
   if (idx >= 0 && process.argv[idx + 1] && !process.argv[idx + 1]!.startsWith('--')) {
@@ -52,7 +81,9 @@ function systemPrompt(displayName: string, glossary: Record<string, string>): st
     `你是日文到中文的台词翻译，正在翻译角色「${displayName}」的台词。`,
     '要求：自然口语中文；保留语气、省略号、口癖；不要合并或拆分句子；不要解释；不要添加原文没有的信息。',
     terms ? `术语表：\n${terms}` : '',
-    '只输出 JSON，格式：{"items":[{"id":"...","zh":"..."}]}',
+    `同时为每条台词打 1-3 个标签，只能从以下集合选择：${TAG_SET.join('、')}。`,
+    '再给一个简短 emotion（2-6 字，如 得意/嘴硬/害羞）；不确定就留空。',
+    '只输出 JSON，格式：{"items":[{"id":"1","zh":"...","tags":["..."],"emotion":"..."}]}',
   ]
     .filter(Boolean)
     .join('\n\n');
@@ -71,7 +102,7 @@ async function callLLM(
   model: string,
   system: string,
   items: { id: string; ja: string }[],
-): Promise<{ id: string; zh: string }[]> {
+): Promise<{ id: string; zh: string; tags: string[]; emotion: string }[]> {
   const res = await fetch(`${baseUrl.replace(/\/$/, '')}/chat/completions`, {
     method: 'POST',
     headers: {
@@ -100,7 +131,13 @@ async function callLLM(
   if (!Array.isArray(parsed?.items)) throw new Error('LLM JSON missing items');
   return parsed.items
     .filter((item: any) => item && typeof item.id === 'string' && typeof item.zh === 'string')
-    .map((item: any) => ({ id: item.id, zh: item.zh.trim() }))
+    .map((item: any) => {
+      const tags = Array.isArray(item.tags)
+        ? [...new Set(item.tags.map(String).filter((tag: string) => TAG_SET_INDEX.has(tag)))].slice(0, 3)
+        : [];
+      const emotion = typeof item.emotion === 'string' ? item.emotion.trim().slice(0, 20) : '';
+      return { id: String(item.id), zh: item.zh.trim(), tags, emotion };
+    })
     .filter((item: { zh: string }) => item.zh.length > 0);
 }
 
@@ -113,6 +150,7 @@ async function main(): Promise<void> {
   const limit = Math.max(0, Number(arg('limit', '0')) || 0);
   const dryRun = flag('dry-run');
   const force = flag('force');
+  const concurrency = Math.max(1, Math.min(6, Number(arg('concurrency', '3')) || 3));
 
   const meta = loadMeta(charactersDir, characterId);
   const bindings = meta.corpora ?? [];
@@ -203,13 +241,38 @@ async function main(): Promise<void> {
        updated_at = excluded.updated_at`,
   );
 
-  let translated = 0;
-  let failed = 0;
+  const getMeta = db.prepare(
+    'SELECT relation, tags, emotion, note, kind FROM line_meta WHERE line_id = ?',
+  );
+  const upsertMeta = db.prepare(
+    `INSERT INTO line_meta (line_id, relation, tags, emotion, note, kind)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(line_id) DO UPDATE SET
+       tags = excluded.tags,
+       emotion = CASE
+         WHEN line_meta.emotion IS NULL OR line_meta.emotion = '' THEN excluded.emotion
+         ELSE line_meta.emotion
+       END`,
+  );
 
-  for (let offset = 0; offset < entries.length; offset += batchSize) {
-    const batch = entries.slice(offset, offset + batchSize);
+  let translated = 0;
+  let tagged = 0;
+  let failed = 0;
+  let doneBatches = 0;
+
+  // LLM 请求可以并发，但 SQLite 事务必须串行。
+  const entriesList = entries;
+  const batches: (typeof entriesList)[] = [];
+  for (let offset = 0; offset < entriesList.length; offset += batchSize) {
+    batches.push(entriesList.slice(offset, offset + batchSize));
+  }
+  const totalBatches = batches.length;
+  let nextBatch = 0;
+  let writeChain: Promise<void> = Promise.resolve();
+
+  const processBatch = async (batch: (typeof entriesList)[number][]): Promise<void> => {
     const items = batch.map((entry, index) => ({ id: String(index + 1), ja: entry.text }));
-    let result: { id: string; zh: string }[] | null = null;
+    let result: { id: string; zh: string; tags: string[]; emotion: string }[] | null = null;
     let lastError: Error | null = null;
 
     for (let attempt = 1; attempt <= 3; attempt++) {
@@ -218,43 +281,82 @@ async function main(): Promise<void> {
         break;
       } catch (err) {
         lastError = err as Error;
-        console.error(`[translate] batch ${offset / batchSize + 1} attempt ${attempt} failed: ${lastError.message}`);
+        console.error(`[translate] batch attempt ${attempt} failed: ${lastError.message}`);
         if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
       }
     }
 
     if (!result) {
       failed++;
-      continue;
+      return;
     }
 
-    const byId = new Map(result.map((item) => [item.id, item.zh]));
-    db.exec('BEGIN');
-    try {
-      for (let i = 0; i < batch.length; i++) {
-        const entry = batch[i]!;
-        const zh = byId.get(String(i + 1));
-        if (!zh) continue;
-        for (const lineId of entry.ids) {
-          upsert.run(lineId, zh, model, Date.now());
+    const byId = new Map(result.map((item) => [item.id, item]));
+    await (writeChain = writeChain.then(() => {
+      db.exec('BEGIN');
+      try {
+        for (let i = 0; i < batch.length; i++) {
+          const entry = batch[i]!;
+          const item = byId.get(String(i + 1));
+          if (!item) continue;
+          for (const lineId of entry.ids) {
+            upsert.run(lineId, item.zh, model, Date.now());
+
+            const old = getMeta.get(lineId) as
+              | { relation: string | null; tags: string | null; emotion: string | null; note: string | null; kind: string | null }
+              | undefined;
+            let oldTags: string[] = [];
+            try {
+              const parsed = JSON.parse(old?.tags ?? '[]');
+              if (Array.isArray(parsed)) oldTags = parsed.map(String);
+            } catch {
+              /* ignore */
+            }
+            const tags = [...new Set([...oldTags, ...item.tags])];
+            upsertMeta.run(
+              lineId,
+              old?.relation ?? null,
+              JSON.stringify(tags),
+              old?.emotion || item.emotion || null,
+              old?.note ?? null,
+              old?.kind ?? 'line',
+            );
+          }
+          translated++;
+          if (item.tags.length > 0) tagged++;
         }
-        translated++;
+        db.exec('COMMIT');
+      } catch (err) {
+        db.exec('ROLLBACK');
+        throw err;
       }
-      db.exec('COMMIT');
-    } catch (err) {
-      db.exec('ROLLBACK');
-      throw err;
-    }
+      doneBatches++;
+      if (doneBatches % 5 === 0 || doneBatches === totalBatches) {
+        console.log(
+          `[translate] batches=${doneBatches}/${totalBatches} lines=${translated}/${entriesList.length} tagged=${tagged} failed=${failed}`,
+        );
+      }
+    }));
+  };
 
-    console.log(
-      `[translate] ${Math.min(offset + batchSize, entries.length)}/${entries.length} unique lines done (${translated} translated)`,
-    );
-  }
+  const worker = async (): Promise<void> => {
+    while (true) {
+      const index = nextBatch++;
+      if (index >= batches.length) return;
+      await processBatch(batches[index]!);
+    }
+  };
+
+  console.log(`[translate] concurrency=${concurrency} batches=${totalBatches}`);
+  await Promise.all(Array.from({ length: concurrency }, () => worker()));
 
   const count = Number(
     (db.prepare('SELECT COUNT(*) AS n FROM translations').get() as { n: number } | undefined)?.n ?? 0,
   );
-  console.log(`[translate] finished, translations=${count}, failedBatches=${failed}`);
+  const metaCount = Number(
+    (db.prepare('SELECT COUNT(*) AS n FROM line_meta WHERE tags IS NOT NULL').get() as { n: number } | undefined)?.n ?? 0,
+  );
+  console.log(`[translate] finished, translations=${count}, tagged=${metaCount}, failedBatches=${failed}`);
   db.close();
   if (failed > 0) process.exitCode = 1;
 }

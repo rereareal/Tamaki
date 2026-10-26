@@ -299,6 +299,17 @@ function main(): void {
          kind = excluded.kind`,
     );
 
+    // 精选 CSV 自带人工中文，先写进 translations，后续 LLM 翻译会跳过这些行。
+    const upsertCuratedTranslation = db.prepare(
+      `INSERT INTO translations (line_id, text_zh, source, model, updated_at)
+       VALUES (?, ?, 'curated', 'curated', ?)
+       ON CONFLICT(line_id) DO UPDATE SET
+         text_zh = excluded.text_zh,
+         source = excluded.source,
+         model = excluded.model,
+         updated_at = excluded.updated_at`,
+    );
+
     db.exec('BEGIN');
     try {
       for (let r = 1; r < rows.length; r++) {
@@ -333,6 +344,9 @@ function main(): void {
           insertLine.run(lineId, syntheticScene, 0, speaker, rawJa, 'curated', partner);
           syntheticCount++;
         }
+
+        const zh = (row[col.zh] ?? '').trim();
+        if (zh) upsertCuratedTranslation.run(lineId, zh, Date.now());
 
         upsertMeta.run(
           lineId,

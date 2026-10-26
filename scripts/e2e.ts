@@ -87,6 +87,9 @@ const {
   startSession,
 } = await import('../src/store/messages');
 const { NapCatClient } = await import('../src/ws');
+const { preflightSearchLines } = await import('../src/handler');
+const { getTool } = await import('../src/tools/registry');
+const { ProactiveGate } = await import('../src/proactive');
 const { openDb } = await import('../src/store/db');
 const { CorpusLibrary, CorpusStore, openCorpusDb } = await import('../src/character/corpus');
 const {
@@ -235,7 +238,8 @@ try {
     before.messages.length === 2 &&
       before.system.includes('OLDMSG-应被压缩') &&
       before.system.includes('长期记忆（客观事实）') &&
-      before.system.includes('群友印象（主观判断'),
+      before.system.includes('群友印象（主观判断') &&
+      before.system.includes('## 工具使用'),
   );
 
   // 10.5 逻辑日界：凌晨 1~2 点不因跨零点失忆
@@ -312,6 +316,33 @@ try {
     `human=${humanCount} bot=${botCount}`,
   );
   vdb.close();
+
+  // 10.55 P1 主动发言门控：空闲 / 冷却 / 每小时上限
+  const gate = new ProactiveGate(
+    {
+      enabled: true,
+      chance: 1,
+      idleMs: 1000,
+      cooldownMs: 1000,
+      maxPerHour: 1,
+      minTextLength: 1,
+      groups: [GROUP],
+    },
+    () => 0,
+  );
+  const gateFirst = gate.shouldInterject(GROUP, 10, 0);
+  const gateSecond = gate.shouldInterject(GROUP, 10, 2000);
+  const gateThird = gate.shouldInterject(GROUP, 10, 2500);
+  check(
+    'P1 主动发言门控：空闲 / 冷却 / 每小时上限',
+    !gateFirst && gateSecond && !gateThird,
+    `first=${gateFirst} second=${gateSecond} third=${gateThird}`,
+  );
+  const disabledGate = new ProactiveGate(
+    { enabled: false, chance: 1, idleMs: 0, cooldownMs: 0, maxPerHour: 1, minTextLength: 0, groups: [GROUP] },
+    () => 0,
+  );
+  check('P1 关闭时不插话', !disabledGate.shouldInterject(GROUP, 100, 10_000));
 
   // 10.6 session 归属隔离：共享 messages，但角色只能看到自己的 session
   const sdb = openDb(':memory:');
@@ -398,12 +429,14 @@ try {
   const jp = corpus.search('お金', { limit: 5 });
   const zh = corpus.search('请客', { limit: 5 });
   const tagged = corpus.search('お', { tags: ['被请客'], limit: 5 });
+  const byTag = corpus.searchByTags(['被请客'], { limit: 5 });
   check(
     'corpus 日文/中文检索 + 标签过滤',
     jp.some((l) => l.id === 's1#1') &&
       zh.some((l) => l.id === 's1#2' && l.textZh?.includes('请客')) &&
       tagged.length === 1 &&
-      tagged[0]!.id === 's1#2',
+      tagged[0]!.id === 's1#2' &&
+      byTag.some((l) => l.id === 's1#2'),
     `jp=${jp.length} zh=${zh.length} tag=${tagged.length}`,
   );
   const ctxLine = corpus.get('s1#2');
@@ -468,6 +501,73 @@ try {
     'search_lines 工具返回结构化台词',
     searchAnswer.includes('"ok":true') && searchAnswer.includes('お金を稼ぐぞ'),
     searchAnswer.slice(0, 200),
+  );
+
+  const webTool = getTool('web_search');
+  const originalFetch = globalThis.fetch;
+  let webUrl = '';
+  let webBody: any = {};
+  try {
+    globalThis.fetch = (async (input: any, init?: any) => {
+      webUrl = String(input);
+      webBody = JSON.parse(String(init?.body ?? '{}'));
+      return new Response(
+        JSON.stringify({
+          results: [
+            {
+              title: 'TypeScript',
+              url: 'https://example.com/ts',
+              summary: 'TypeScript is JavaScript with syntax for types.',
+              site_name: 'example',
+              date: '2026-01-01',
+              authority: 3,
+            },
+          ],
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }) as typeof fetch;
+    const webResult = await webTool!.execute({ query: 'TypeScript', count: 1 }, {} as any);
+    check(
+      'web_search 调用 DeepSeek 搜索接口',
+      webUrl.endsWith('/tools/search') &&
+        webBody?.query === 'TypeScript' &&
+        (webResult as any)?.results?.[0]?.url === 'https://example.com/ts',
+      JSON.stringify(webResult).slice(0, 200),
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const fetchTool = getTool('web_fetch');
+  const originalFetch2 = globalThis.fetch;
+  let fetchUrl = '';
+  try {
+    globalThis.fetch = (async (input: any) => {
+      fetchUrl = String(input);
+      return new Response(
+        JSON.stringify({
+          title: 'Example',
+          content: '# Hello\n\nWorld',
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }) as typeof fetch;
+    const fetchResult = await fetchTool!.execute({ url: 'https://example.com/page' }, {} as any);
+    check(
+      'web_fetch 抓取网页正文',
+      fetchUrl.endsWith('/tools/fetch') && (fetchResult as any)?.content?.includes('Hello'),
+      JSON.stringify(fetchResult).slice(0, 200),
+    );
+  } finally {
+    globalThis.fetch = originalFetch2;
+  }
+
+  const preflightText = await preflightSearchLines(searchCtx as any, 'お金');
+  check(
+    '回答前由代码强制执行一次 search_lines',
+    preflightText.includes('お金を稼ぐぞ') && preflightText.includes('原文'),
+    preflightText.slice(0, 120),
   );
   toolCorpus.close();
 

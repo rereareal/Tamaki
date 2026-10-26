@@ -222,6 +222,53 @@ export class CorpusStore {
     return result;
   }
 
+  /**
+   * 按 tags 检索。用于中文消息没有命中原文/译文时，按主题标签兜底。
+   */
+  searchByTags(tags: string[], opts: SearchOptions = {}): CorpusLine[] {
+    const wanted = [...new Set(tags.map((t) => t.trim()).filter(Boolean))];
+    if (wanted.length === 0 || this.speakers.length === 0) return [];
+
+    const speakerMarks = this.speakers.map(() => '?').join(',');
+    const tagSql = wanted.map(() => "m.tags LIKE ? ESCAPE '\\'").join(' OR ');
+    const tagParams = wanted.map((tag) => `%"${escapeLike(tag)}"%`);
+    let rows: CorpusRow[];
+    try {
+      rows = this.db
+        .prepare(
+          `${SELECT_LINE} WHERE l.speaker IN (${speakerMarks}) AND m.tags IS NOT NULL AND (${tagSql}) LIMIT 240`,
+        )
+        .all(...this.speakers, ...tagParams) as unknown as CorpusRow[];
+    } catch (err) {
+      log.warn('tag search failed', { corpusId: this.corpusId, error: (err as Error).message });
+      return [];
+    }
+
+    const wantedSet = new Set(wanted);
+    const lines = rows.map((row) => toLine(row, this.relations, this.corpusId));
+    const scored = lines
+      .map((line) => ({
+        line,
+        score:
+          line.tags.filter((tag) => wantedSet.has(tag)).length * 20 +
+          (line.kind === 'snippet' ? 5 : 0) +
+          (line.sceneType === 'main' ? 5 : line.sceneType === 'support' ? 3 : 0),
+      }))
+      .sort((a, b) => b.score - a.score);
+
+    const seen = new Set<string>();
+    const result: CorpusLine[] = [];
+    const limit = Math.max(1, Math.min(10, opts.limit ?? 5));
+    for (const { line } of scored) {
+      const key = line.textJa.replace(/\s+/g, '');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      result.push(line);
+      if (result.length >= limit) break;
+    }
+    return result;
+  }
+
   get(id: string): CorpusLine | null {
     const row = this.db.prepare(`${SELECT_LINE} WHERE l.id = ?`).get(id) as CorpusRow | undefined;
     return row ? toLine(row, this.relations, this.corpusId) : null;
@@ -307,6 +354,24 @@ export class CorpusLibrary {
       if (seen.has(key)) continue;
       seen.add(key);
       result.push(item.line);
+      if (result.length >= limit) break;
+    }
+    return result;
+  }
+
+  searchByTags(tags: string[], opts: SearchOptions = {}): CorpusLine[] {
+    const limit = Math.max(1, Math.min(10, opts.limit ?? 5));
+    const merged: CorpusLine[] = [];
+    for (const store of this.stores) {
+      merged.push(...store.searchByTags(tags, { ...opts, limit }));
+    }
+    const seen = new Set<string>();
+    const result: CorpusLine[] = [];
+    for (const line of merged) {
+      const key = `${line.corpusId}:${line.textJa.replace(/\s+/g, '')}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      result.push(line);
       if (result.length >= limit) break;
     }
     return result;
